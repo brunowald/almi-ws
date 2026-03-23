@@ -1,5 +1,5 @@
 {
-  "signalingUrl": "ws://localhost:8765",
+  "signalingUrl": "wss://signalign.up.railway.app",
   "roomId": "almi-room-001",
   "stunServers": [
     { "urls": "stun:stun.l.google.com:19302" },
