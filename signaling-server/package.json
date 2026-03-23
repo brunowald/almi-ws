@@ -1,0 +1,12 @@
+{
+  "name": "almi-signaling",
+  "version": "1.0.0",
+  "description": "WebSocket signaling server for almi WebRTC voice system",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
