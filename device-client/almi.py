@@ -39,16 +39,20 @@ async def _ring_loop(sample_rate: int = 48000):
     """Ring continuously (2 s on / 4 s off) until cancelled."""
     loop = asyncio.get_event_loop()
     on_samples = int(sample_rate * 2.0)
+    off_samples = int(sample_rate * 4.0)
     t = np.linspace(0, 2.0, on_samples, endpoint=False)
     tone = (np.sin(2 * np.pi * 440 * t) + np.sin(2 * np.pi * 480 * t)) / 2
-    pcm = (tone * 16000).astype(np.int16)
+    pcm_on  = (tone * 16000).astype(np.int16).reshape(-1, 1)
+    pcm_off = np.zeros((off_samples, 1), dtype=np.int16)
+    stream = sd.OutputStream(samplerate=sample_rate, channels=1, dtype="int16")
+    stream.start()
     try:
         while True:
-            sd.play(pcm, sample_rate)
-            await loop.run_in_executor(None, sd.wait)
-            await asyncio.sleep(4.0)
+            await loop.run_in_executor(None, stream.write, pcm_on)
+            await loop.run_in_executor(None, stream.write, pcm_off)
     except asyncio.CancelledError:
-        sd.stop()
+        stream.stop()
+        stream.close()
         raise
 
 

@@ -347,25 +347,25 @@ async def _run_answerer(pc: RTCPeerConnection, ws, config: dict):
 # ---------------------------------------------------------------------------
 
 async def _play_ring(sample_rate: int = 48000, rings: int = 2):
-    """
-    Play a telephone ring tone (440 Hz + 480 Hz, classic NA ring).
-    Each ring = 2 s on / 0.5 s off.  Runs in a thread executor so the
-    event loop stays responsive during playback.
-    """
+    """Play a telephone ring tone (440 Hz + 480 Hz). Each ring = 2 s on / 0.5 s off."""
     loop = asyncio.get_event_loop()
     on_samples  = int(sample_rate * 2.0)
     off_samples = int(sample_rate * 0.5)
     t = np.linspace(0, 2.0, on_samples, endpoint=False)
     tone = (np.sin(2 * np.pi * 440 * t) + np.sin(2 * np.pi * 480 * t)) / 2
-    pcm_on  = (tone * 16000).astype(np.int16)
-    pcm_off = np.zeros(off_samples, dtype=np.int16)
+    pcm_on  = (tone * 16000).astype(np.int16).reshape(-1, 1)
+    pcm_off = np.zeros((off_samples, 1), dtype=np.int16)
 
     def _play():
-        for _ in range(rings):
-            sd.play(pcm_on,  sample_rate)
-            sd.wait()
-            sd.play(pcm_off, sample_rate)
-            sd.wait()
+        stream = sd.OutputStream(samplerate=sample_rate, channels=1, dtype="int16")
+        stream.start()
+        try:
+            for _ in range(rings):
+                stream.write(pcm_on)
+                stream.write(pcm_off)
+        finally:
+            stream.stop()
+            stream.close()
 
     log.info("Ring!")
     await loop.run_in_executor(None, _play)
