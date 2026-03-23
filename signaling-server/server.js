@@ -9,8 +9,27 @@ const rooms = new Map();
 
 const wss = new WebSocketServer({ port: PORT });
 
+// Keep connections alive through Railway's reverse proxy.
+// Ping every 25 s; if no pong within 10 s, terminate the socket.
+const PING_INTERVAL = 25_000;
+
+const heartbeat = setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.isAlive === false) {
+      console.log(`[${ws.roomId || '?'}] terminating dead socket`);
+      return ws.terminate();
+    }
+    ws.isAlive = false;
+    ws.ping();
+  }
+}, PING_INTERVAL);
+
+wss.on('close', () => clearInterval(heartbeat));
+
 wss.on('connection', (ws) => {
   ws.roomId = null;
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
 
   ws.on('message', (raw) => {
     let msg;
