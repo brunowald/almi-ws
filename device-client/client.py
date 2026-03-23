@@ -284,7 +284,7 @@ async def _wait_for_ice_complete(pc: RTCPeerConnection, timeout: float = 30.0):
 
     @pc.on("icegatheringstatechange")
     def _on_state():
-        log.debug("ICE gathering state: %s", pc.iceGatheringState)
+        log.info("ICE gathering state: %s", pc.iceGatheringState)
         if pc.iceGatheringState == "complete":
             done.set()
 
