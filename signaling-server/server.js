@@ -33,8 +33,8 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    if (type === 'offer' || type === 'answer') {
-      if (!ws.roomId) { console.warn('Peer sent offer/answer before joining a room'); return; }
+    if (['offer', 'answer', 'call', 'accept', 'reject'].includes(type)) {
+      if (!ws.roomId) { console.warn(`Peer sent '${type}' before joining a room`); return; }
       const peers = rooms.get(ws.roomId);
       if (!peers) return;
       let forwarded = 0;

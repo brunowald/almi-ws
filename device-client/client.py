@@ -293,6 +293,35 @@ async def _run_answerer(pc: RTCPeerConnection, ws, config: dict):
 
 
 # ---------------------------------------------------------------------------
+# Ring tone
+# ---------------------------------------------------------------------------
+
+async def _play_ring(sample_rate: int = 48000, rings: int = 2):
+    """
+    Play a telephone ring tone (440 Hz + 480 Hz, classic NA ring).
+    Each ring = 2 s on / 0.5 s off.  Runs in a thread executor so the
+    event loop stays responsive during playback.
+    """
+    loop = asyncio.get_event_loop()
+    on_samples  = int(sample_rate * 2.0)
+    off_samples = int(sample_rate * 0.5)
+    t = np.linspace(0, 2.0, on_samples, endpoint=False)
+    tone = (np.sin(2 * np.pi * 440 * t) + np.sin(2 * np.pi * 480 * t)) / 2
+    pcm_on  = (tone * 16000).astype(np.int16)
+    pcm_off = np.zeros(off_samples, dtype=np.int16)
+
+    def _play():
+        for _ in range(rings):
+            sd.play(pcm_on,  sample_rate)
+            sd.wait()
+            sd.play(pcm_off, sample_rate)
+            sd.wait()
+
+    log.info("Ring!")
+    await loop.run_in_executor(None, _play)
+
+
+# ---------------------------------------------------------------------------
 # Single connection attempt
 # ---------------------------------------------------------------------------
 
@@ -320,7 +349,9 @@ async def _connect_and_run(config: dict, role: str):
     @pc.on("connectionstatechange")
     async def on_connection_state():
         log.info("WebRTC connection state: %s", pc.connectionState)
-        if pc.connectionState in ("failed", "closed"):
+        if pc.connectionState == "connected":
+            asyncio.ensure_future(_play_ring(audio_cfg["sampleRate"]))
+        elif pc.connectionState in ("failed", "closed"):
             await pc.close()
 
     try:
