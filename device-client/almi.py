@@ -57,7 +57,7 @@ async def _ring_loop(sample_rate: int = 48000):
 
 
 # ---------------------------------------------------------------------------
-# WebRTC helpers
+# WebRTC call flow (caller + answerer unified)
 # ---------------------------------------------------------------------------
 
 def _make_pc(config: dict) -> RTCPeerConnection:
@@ -65,12 +65,16 @@ def _make_pc(config: dict) -> RTCPeerConnection:
     return RTCPeerConnection(configuration=RTCConfiguration(iceServers=ice_servers))
 
 
-async def _run_call(pc: RTCPeerConnection, config: dict):
-    """Add mic/speaker to pc, hold until the connection drops."""
+async def _run_call(ws, event_queue: asyncio.Queue, config: dict, is_caller: bool):
+    """
+    Full call lifecycle: setup tracks → negotiate SDP → stream audio.
+    Tracks MUST be added before createOffer/createAnswer so they appear in the SDP.
+    """
     audio_cfg = config["audio"]
+    pc = _make_pc(config)
     mic = MicrophoneTrack(audio_cfg)
     sink = AudioSink(audio_cfg)
-    pc.addTrack(mic)
+    pc.addTrack(mic)          # ← must be before createOffer/createAnswer
     call_done = asyncio.Event()
 
     @pc.on("track")
@@ -88,59 +92,52 @@ async def _run_call(pc: RTCPeerConnection, config: dict):
             call_done.set()
 
     try:
+        if is_caller:
+            offer = await pc.createOffer()
+            await pc.setLocalDescription(offer)
+            await _wait_for_ice_complete(pc)
+            await ws.send(json.dumps({
+                "type": "offer",
+                "room": config["roomId"],
+                "sdp": pc.localDescription.sdp,
+                "sdpType": pc.localDescription.type,
+            }))
+            log.info("Offer sent, waiting for answer…")
+            while True:
+                source, data = await event_queue.get()
+                if source == "error":
+                    raise data
+                if source == "ws" and data.get("type") == "answer":
+                    break
+            await pc.setRemoteDescription(
+                RTCSessionDescription(sdp=data["sdp"], type=data["sdpType"])
+            )
+        else:
+            while True:
+                source, data = await event_queue.get()
+                if source == "error":
+                    raise data
+                if source == "ws" and data.get("type") == "offer":
+                    break
+            await pc.setRemoteDescription(
+                RTCSessionDescription(sdp=data["sdp"], type=data["sdpType"])
+            )
+            answer = await pc.createAnswer()
+            await pc.setLocalDescription(answer)
+            await _wait_for_ice_complete(pc)
+            await ws.send(json.dumps({
+                "type": "answer",
+                "room": config["roomId"],
+                "sdp": pc.localDescription.sdp,
+                "sdpType": pc.localDescription.type,
+            }))
+
+        log.info("Audio channel is live")
         await call_done.wait()
     finally:
         mic.stop()
         await pc.close()
         log.info("Call ended.")
-
-
-async def _caller_flow(ws, event_queue: asyncio.Queue, config: dict):
-    """Send offer → wait for answer → run call."""
-    pc = _make_pc(config)
-
-    offer = await pc.createOffer()
-    await pc.setLocalDescription(offer)
-    await _wait_for_ice_complete(pc)
-
-    await ws.send(json.dumps({
-        "type": "offer",
-        "room": config["roomId"],
-        "sdp": pc.localDescription.sdp,
-        "sdpType": pc.localDescription.type,
-    }))
-    log.info("Offer sent, waiting for answer…")
-
-    while True:
-        source, data = await event_queue.get()
-        if source == "ws" and data.get("type") == "answer":
-            break
-
-    await pc.setRemoteDescription(RTCSessionDescription(sdp=data["sdp"], type=data["sdpType"]))
-    await _run_call(pc, config)
-
-
-async def _answerer_flow(ws, event_queue: asyncio.Queue, config: dict):
-    """Wait for offer → send answer → run call."""
-    pc = _make_pc(config)
-
-    while True:
-        source, data = await event_queue.get()
-        if source == "ws" and data.get("type") == "offer":
-            break
-
-    await pc.setRemoteDescription(RTCSessionDescription(sdp=data["sdp"], type=data["sdpType"]))
-    answer = await pc.createAnswer()
-    await pc.setLocalDescription(answer)
-    await _wait_for_ice_complete(pc)
-
-    await ws.send(json.dumps({
-        "type": "answer",
-        "room": config["roomId"],
-        "sdp": pc.localDescription.sdp,
-        "sdpType": pc.localDescription.type,
-    }))
-    await _run_call(pc, config)
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +192,7 @@ async def _session(config: dict):
                         continue
 
                     log.info("Call accepted — connecting…")
-                    await _caller_flow(ws, event_queue, config)
+                    await _run_call(ws, event_queue, config, is_caller=True)
                     print("\nPress Enter to call.\n")
 
                 # ── Incoming call ─────────────────────────────────────────────
@@ -223,7 +220,7 @@ async def _session(config: dict):
                     if dat2 in ("y", ""):
                         await ws.send(json.dumps({"type": "accept", "room": config["roomId"]}))
                         log.info("Answering…")
-                        await _answerer_flow(ws, event_queue, config)
+                        await _run_call(ws, event_queue, config, is_caller=False)
                         print("\nPress Enter to call.\n")
                     else:
                         await ws.send(json.dumps({"type": "reject", "room": config["roomId"]}))
