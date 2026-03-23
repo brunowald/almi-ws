@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 almi WebRTC Voice Client
 Two-device, full-duplex, always-on voice channel over WebRTC.
@@ -274,7 +276,7 @@ class AudioSink:
 # ICE / signaling helpers
 # ---------------------------------------------------------------------------
 
-async def _wait_for_ice_complete(pc: RTCPeerConnection, timeout: float = 15.0):
+async def _wait_for_ice_complete(pc: RTCPeerConnection, timeout: float = 30.0):
     """Wait until all ICE candidates have been gathered (non-trickle strategy)."""
     if pc.iceGatheringState == "complete":
         return
