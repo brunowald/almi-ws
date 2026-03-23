@@ -13,11 +13,13 @@ import json
 import logging
 import os
 import platform
+import threading
 import time
 from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
+from pyaec import Aec
 from av import AudioFrame
 from aiortc import (
     RTCConfiguration,
@@ -57,6 +59,44 @@ def determine_role() -> str:
 
 
 # ---------------------------------------------------------------------------
+# EchoCancellerBridge — shared AEC between MicrophoneTrack and AudioSink
+# ---------------------------------------------------------------------------
+
+class EchoCancellerBridge:
+    """Thread-safe bridge that feeds playback reference and cancels echo from mic."""
+
+    def __init__(self, frame_size: int, sample_rate: int, filter_length_ms: int = 200):
+        filter_length = int(sample_rate * filter_length_ms / 1000)
+        self._aec = Aec(frame_size, filter_length, sample_rate)
+        self._playback_ref: bytes | None = None
+        self._lock = threading.Lock()
+        log.info(
+            "AEC initialised: frame_size=%d, filter_length=%d (~%dms)",
+            frame_size, filter_length, filter_length_ms,
+        )
+
+    def feed_playback(self, pcm_int16: np.ndarray):
+        """Called by AudioSink with each frame written to speakers."""
+        mono = pcm_int16[:, 0] if pcm_int16.ndim == 2 else pcm_int16
+        with self._lock:
+            self._playback_ref = mono.astype(np.int16).tobytes()
+
+    def cancel(self, mic_int16: np.ndarray) -> np.ndarray:
+        """Called by MicrophoneTrack to remove echo from captured audio."""
+        mono = mic_int16[:, 0] if mic_int16.ndim == 2 else mic_int16
+        mic_bytes = mono.astype(np.int16).tobytes()
+        with self._lock:
+            ref = self._playback_ref
+        if ref is None:
+            return mic_int16
+        out_bytes = self._aec.cancel_echo(mic_bytes, ref)
+        out = np.frombuffer(out_bytes, dtype=np.int16)
+        if mic_int16.ndim == 2:
+            return out.reshape(-1, 1)
+        return out
+
+
+# ---------------------------------------------------------------------------
 # MicrophoneTrack — bridges sounddevice callback thread → aiortc async world
 # ---------------------------------------------------------------------------
 
@@ -65,12 +105,13 @@ class MicrophoneTrack(AudioStreamTrack):
 
     kind = "audio"
 
-    def __init__(self, audio_cfg: dict):
+    def __init__(self, audio_cfg: dict, echo_canceller: EchoCancellerBridge | None = None):
         super().__init__()
         self._sample_rate: int = audio_cfg["sampleRate"]
         self._channels: int = audio_cfg["channels"]
         self._frame_size: int = audio_cfg["frameSize"]
         self._latency = audio_cfg.get("latency", "low")
+        self._aec = echo_canceller
 
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=50)
         self._loop = asyncio.get_event_loop()
@@ -120,6 +161,10 @@ class MicrophoneTrack(AudioStreamTrack):
 
         data = await self._queue.get()  # shape: (frame_size, channels)
 
+        # Apply acoustic echo cancellation if available.
+        if self._aec is not None:
+            data = self._aec.cancel(data)
+
         # Real-time pacing: sleep until this frame's expected wall-clock time.
         if self._start is None:
             self._start = time.monotonic()
@@ -157,11 +202,12 @@ class MicrophoneTrack(AudioStreamTrack):
 class AudioSink:
     """Writes decoded Opus frames from the remote peer to the system speaker."""
 
-    def __init__(self, audio_cfg: dict):
+    def __init__(self, audio_cfg: dict, echo_canceller: EchoCancellerBridge | None = None):
         self._sample_rate: int = audio_cfg["sampleRate"]
         self._channels: int = audio_cfg["channels"]
         self._frame_size: int = audio_cfg["frameSize"]
         self._latency = audio_cfg.get("latency", "low")
+        self._aec = echo_canceller
         self._stream = sd.OutputStream(
             samplerate=self._sample_rate,
             channels=self._channels,
@@ -213,6 +259,8 @@ class AudioSink:
                 # Run the blocking write in a thread so it never stalls the
                 # event loop (which would prevent STUN consent-refresh responses).
                 pcm = data.T.copy()  # (samples, channels); copy for thread safety
+                if self._aec is not None:
+                    self._aec.feed_playback(pcm)
                 await loop.run_in_executor(None, self._stream.write, pcm)
         except Exception as exc:
             log.info("AudioSink.consume ended: %s", exc)
@@ -335,8 +383,12 @@ async def _connect_and_run(config: dict, role: str):
     rtc_config = RTCConfiguration(iceServers=ice_servers)
     audio_cfg = config["audio"]
 
-    mic = MicrophoneTrack(audio_cfg)
-    sink = AudioSink(audio_cfg)
+    aec = EchoCancellerBridge(
+        frame_size=audio_cfg["frameSize"],
+        sample_rate=audio_cfg["sampleRate"],
+    )
+    mic = MicrophoneTrack(audio_cfg, echo_canceller=aec)
+    sink = AudioSink(audio_cfg, echo_canceller=aec)
     pc = RTCPeerConnection(configuration=rtc_config)
     pc.addTrack(mic)
 
