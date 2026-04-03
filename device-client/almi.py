@@ -127,8 +127,8 @@ async def _run_call(ws, event_queue: asyncio.Queue, config: dict, is_caller: boo
         frame_size=audio_cfg["frameSize"],
         sample_rate=audio_cfg["sampleRate"],
     )
-    mic = MicrophoneTrack(audio_cfg, echo_canceller=aec)
-    sink = AudioSink(audio_cfg, echo_canceller=aec)
+    mic = MicrophoneTrack(audio_cfg)
+    sink = AudioSink(audio_cfg)
     pc.addTrack(mic)          # ← must be before createOffer/createAnswer
     call_done = asyncio.Event()
     end_reason = "connection_lost"
