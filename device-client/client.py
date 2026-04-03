@@ -92,6 +92,8 @@ class EchoCancellerBridge:
         if ref is None:
             return mic_int16
         out_bytes = self._aec.cancel_echo(mic_bytes, ref)
+        if isinstance(out_bytes, list):
+            out_bytes = bytes(out_bytes)
         out = np.frombuffer(out_bytes, dtype=np.int16)
         if mic_int16.ndim == 2:
             return out.reshape(-1, 1)
