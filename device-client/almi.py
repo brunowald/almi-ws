@@ -22,7 +22,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
 from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
 
-from client import MicrophoneTrack, AudioSink, load_config, _wait_for_ice_complete, _play_ring
+from client import MicrophoneTrack, AudioSink, EchoCancellerBridge, load_config, _wait_for_ice_complete, _play_ring
 
 try:
     import tty
@@ -123,8 +123,12 @@ async def _run_call(ws, event_queue: asyncio.Queue, config: dict, is_caller: boo
     """
     audio_cfg = config["audio"]
     pc = _make_pc(config)
-    mic = MicrophoneTrack(audio_cfg)
-    sink = AudioSink(audio_cfg)
+    aec = EchoCancellerBridge(
+        frame_size=audio_cfg["frameSize"],
+        sample_rate=audio_cfg["sampleRate"],
+    )
+    mic = MicrophoneTrack(audio_cfg, echo_canceller=aec)
+    sink = AudioSink(audio_cfg, echo_canceller=aec)
     pc.addTrack(mic)          # ← must be before createOffer/createAnswer
     call_done = asyncio.Event()
     end_reason = "connection_lost"

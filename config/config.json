@@ -9,6 +9,6 @@
     "sampleRate": 48000,
     "channels": 1,
     "frameSize": 960,
-    "latency": "low"
+    "latency": "high"
   }
 }
