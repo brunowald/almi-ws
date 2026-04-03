@@ -76,44 +76,35 @@ def _show_dial_prompt(digits: list[str]):
 # ---------------------------------------------------------------------------
 
 async def _ring_loop(sample_rate: int = 48000):
-    """Ring continuously (2 s on / 4 s off) until cancelled."""
+    """Ring continuously (2 s on / 4 s off) until cancelled.
+    Uses sd.play()/sd.wait() to avoid opening extra OutputStream (ALSA compat).
+    """
     loop = asyncio.get_event_loop()
     on_samples = int(sample_rate * 2.0)
-    off_samples = int(sample_rate * 4.0)
     t = np.linspace(0, 2.0, on_samples, endpoint=False)
     tone = (np.sin(2 * np.pi * 440 * t) + np.sin(2 * np.pi * 480 * t)) / 2
-    pcm_on  = (tone * 16000).astype(np.int16).reshape(-1, 1)
-    pcm_off = np.zeros((off_samples, 1), dtype=np.int16)
-    stream = sd.OutputStream(samplerate=sample_rate, channels=1, dtype="int16")
-    stream.start()
+    pcm = (tone * 16000).astype(np.int16)
     try:
         while True:
-            await loop.run_in_executor(None, stream.write, pcm_on)
-            await loop.run_in_executor(None, stream.write, pcm_off)
+            sd.play(pcm, samplerate=sample_rate)
+            await loop.run_in_executor(None, sd.wait)
+            await asyncio.sleep(4.0)
     except asyncio.CancelledError:
-        stream.stop()
-        stream.close()
+        sd.stop()
         raise
 
 
 async def _play_end_tone(sample_rate: int = 48000, duration: float = 3.0):
-    """Tono prolongado continuo que indica fin de llamada (480 Hz)."""
+    """Tono prolongado continuo que indica fin de llamada (480 Hz).
+    Uses sd.play()/sd.wait() to avoid opening extra OutputStream (ALSA compat).
+    """
     loop = asyncio.get_event_loop()
     samples = int(sample_rate * duration)
     t = np.linspace(0, duration, samples, endpoint=False)
     tone = np.sin(2 * np.pi * 480 * t)
-    pcm = (tone * 16000).astype(np.int16).reshape(-1, 1)
-
-    def _play():
-        stream = sd.OutputStream(samplerate=sample_rate, channels=1, dtype="int16")
-        stream.start()
-        try:
-            stream.write(pcm)
-        finally:
-            stream.stop()
-            stream.close()
-
-    await loop.run_in_executor(None, _play)
+    pcm = (tone * 16000).astype(np.int16)
+    sd.play(pcm, samplerate=sample_rate)
+    await loop.run_in_executor(None, sd.wait)
 
 
 # ---------------------------------------------------------------------------
