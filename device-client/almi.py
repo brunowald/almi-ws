@@ -96,6 +96,26 @@ async def _ring_loop(sample_rate: int = 48000):
         raise
 
 
+async def _play_end_tone(sample_rate: int = 48000, duration: float = 3.0):
+    """Tono prolongado continuo que indica fin de llamada (480 Hz)."""
+    loop = asyncio.get_event_loop()
+    samples = int(sample_rate * duration)
+    t = np.linspace(0, duration, samples, endpoint=False)
+    tone = np.sin(2 * np.pi * 480 * t)
+    pcm = (tone * 16000).astype(np.int16).reshape(-1, 1)
+
+    def _play():
+        stream = sd.OutputStream(samplerate=sample_rate, channels=1, dtype="int16")
+        stream.start()
+        try:
+            stream.write(pcm)
+        finally:
+            stream.stop()
+            stream.close()
+
+    await loop.run_in_executor(None, _play)
+
+
 # ---------------------------------------------------------------------------
 # WebRTC call flow (caller + answerer unified)
 # ---------------------------------------------------------------------------
@@ -108,7 +128,7 @@ def _make_pc(config: dict) -> RTCPeerConnection:
 async def _run_call(ws, event_queue: asyncio.Queue, config: dict, is_caller: bool):
     """
     Full call lifecycle: setup tracks → negotiate SDP → stream audio.
-    Tracks MUST be added before createOffer/createAnswer so they appear in the SDP.
+    Returns: "local_hangup" | "remote_hangup" | "connection_lost"
     """
     audio_cfg = config["audio"]
     pc = _make_pc(config)
@@ -116,6 +136,7 @@ async def _run_call(ws, event_queue: asyncio.Queue, config: dict, is_caller: boo
     sink = AudioSink(audio_cfg)
     pc.addTrack(mic)          # ← must be before createOffer/createAnswer
     call_done = asyncio.Event()
+    end_reason = "connection_lost"
 
     @pc.on("track")
     def on_track(track):
@@ -126,9 +147,7 @@ async def _run_call(ws, event_queue: asyncio.Queue, config: dict, is_caller: boo
     @pc.on("connectionstatechange")
     async def on_state():
         log.info("WebRTC connection state: %s", pc.connectionState)
-        if pc.connectionState == "connected":
-            asyncio.ensure_future(_play_ring(audio_cfg["sampleRate"], rings=1))
-        elif pc.connectionState in ("failed", "closed"):
+        if pc.connectionState in ("failed", "closed"):
             call_done.set()
 
     try:
@@ -172,12 +191,32 @@ async def _run_call(ws, event_queue: asyncio.Queue, config: dict, is_caller: boo
                 "sdpType": pc.localDescription.type,
             }))
 
-        log.info("Audio channel is live")
-        await call_done.wait()
+        log.info("Audio channel is live — press (c) to hang up")
+        print("\r\033[KIn call — press (c) to hang up", flush=True)
+
+        # Wait for: connection drop, local hangup (key 'c'), or remote hangup
+        while not call_done.is_set():
+            try:
+                source, data = await asyncio.wait_for(event_queue.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+
+            if source == "key" and data == "c":
+                end_reason = "local_hangup"
+                await ws.send(json.dumps({
+                    "type": "hangup", "room": config["roomId"],
+                }))
+                break
+            elif source == "ws" and data.get("type") == "hangup":
+                end_reason = "remote_hangup"
+                break
+            elif source == "error":
+                break
+
+        return end_reason
     finally:
         mic.stop()
         await pc.close()
-        log.info("Call ended.")
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +299,9 @@ async def _session(config: dict):
                                 "type": "call", "room": config["roomId"],
                             }))
 
+                            # Emisor escucha tono de espera (ringback)
+                            ringback_task = asyncio.ensure_future(_ring_loop(audio_sr))
+
                             # Wait for accept / reject
                             while True:
                                 src2, dat2 = await event_queue.get()
@@ -268,14 +310,23 @@ async def _session(config: dict):
                                 ):
                                     break
 
+                            ringback_task.cancel()
+                            try:
+                                await ringback_task
+                            except asyncio.CancelledError:
+                                pass
+
                             if dat2["type"] == "reject":
-                                print("Call rejected.")
+                                print("\r\033[KCall rejected.")
+                                await _play_end_tone(audio_sr)
                                 _show_dial_prompt(digits)
                                 continue
 
                             log.info("Call accepted — connecting…")
-                            await _run_call(ws, event_queue, config, is_caller=True)
-                            print("Call ended.")
+                            reason = await _run_call(ws, event_queue, config, is_caller=True)
+                            if reason in ("remote_hangup", "connection_lost"):
+                                await _play_end_tone(audio_sr)
+                            print("\r\033[KCall ended.")
                             _show_dial_prompt(digits)
 
                         # Any other key → ignore
@@ -305,8 +356,10 @@ async def _session(config: dict):
                             await ws.send(json.dumps({
                                 "type": "accept", "room": config["roomId"],
                             }))
-                            await _run_call(ws, event_queue, config, is_caller=False)
-                            print("Call ended.")
+                            reason = await _run_call(ws, event_queue, config, is_caller=False)
+                            if reason in ("remote_hangup", "connection_lost"):
+                                await _play_end_tone(audio_sr)
+                            print("\r\033[KCall ended.")
                         else:
                             await ws.send(json.dumps({
                                 "type": "reject", "room": config["roomId"],

@@ -52,7 +52,7 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    if (['offer', 'answer', 'call', 'accept', 'reject'].includes(type)) {
+    if (['offer', 'answer', 'call', 'accept', 'reject', 'hangup'].includes(type)) {
       if (!ws.roomId) { console.warn(`Peer sent '${type}' before joining a room`); return; }
       const peers = rooms.get(ws.roomId);
       if (!peers) return;
