@@ -2,8 +2,8 @@
 almi — two-device always-on voice system.
 
 Both devices run this script.
-  - Press Enter to call the other device.
-  - When a call comes in, the phone rings. Press y (or Enter) to answer, n to reject.
+  - Type a number (1-8 digits) then press Enter to call.
+  - When a call comes in, the phone rings. Press y to answer, n to reject.
   - Ctrl+C to quit.
 
 Usage:
@@ -13,6 +13,7 @@ Usage:
 import asyncio
 import json
 import logging
+import os
 import sys
 
 import numpy as np
@@ -23,12 +24,51 @@ from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSession
 
 from client import MicrophoneTrack, AudioSink, load_config, _wait_for_ice_complete, _play_ring
 
+try:
+    import tty
+    import termios
+    _HAS_RAW_TTY = True
+except ImportError:
+    _HAS_RAW_TTY = False
+
+# ---------------------------------------------------------------------------
+# DTMF tone definitions (standard telephone dual-tone multi-frequency)
+# ---------------------------------------------------------------------------
+
+DTMF_FREQS = {
+    '1': (697, 1209), '2': (697, 1336), '3': (697, 1477),
+    '4': (770, 1209), '5': (770, 1336), '6': (770, 1477),
+    '7': (852, 1209), '8': (852, 1336), '9': (852, 1477),
+    '0': (941, 1336),
+}
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# DTMF tone playback & dialing UI
+# ---------------------------------------------------------------------------
+
+MAX_DIAL_DIGITS = 8
+
+
+def _play_dtmf_tone(digit: str, sample_rate: int = 48000, duration: float = 0.15):
+    """Play a DTMF dual-tone for *digit* (non-blocking)."""
+    f_low, f_high = DTMF_FREQS[digit]
+    t = np.linspace(0, duration, int(sample_rate * duration), endpoint=False)
+    tone = (np.sin(2 * np.pi * f_low * t) + np.sin(2 * np.pi * f_high * t)) / 2
+    pcm = (tone * 16000).astype(np.int16)
+    sd.play(pcm, samplerate=sample_rate)
+
+
+def _show_dial_prompt(digits: list[str]):
+    num = ''.join(digits)
+    print(f"\r\033[KDial: {num}_", end='', flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -145,91 +185,142 @@ async def _run_call(ws, event_queue: asyncio.Queue, config: dict, is_caller: boo
 # ---------------------------------------------------------------------------
 
 async def _session(config: dict):
-    async with websockets.connect(
-        config["signalingUrl"], ping_interval=20, ping_timeout=10
-    ) as ws:
-        await ws.send(json.dumps({"type": "join", "room": config["roomId"]}))
-        print("\nReady. Press Enter to call.\n")
+    audio_sr = config["audio"]["sampleRate"]
 
-        event_queue: asyncio.Queue = asyncio.Queue()
+    # Put terminal in cbreak mode for immediate keypress reading.
+    fd = sys.stdin.fileno()
+    old_term = termios.tcgetattr(fd) if _HAS_RAW_TTY else None
+    if _HAS_RAW_TTY:
+        tty.setcbreak(fd)
 
-        async def _ws_pump():
+    try:
+        async with websockets.connect(
+            config["signalingUrl"], ping_interval=20, ping_timeout=10
+        ) as ws:
+            await ws.send(json.dumps({"type": "join", "room": config["roomId"]}))
+
+            event_queue: asyncio.Queue = asyncio.Queue()
+            digits: list[str] = []
+
+            async def _ws_pump():
+                try:
+                    async for raw in ws:
+                        await event_queue.put(("ws", json.loads(raw)))
+                except Exception as exc:
+                    await event_queue.put(("error", exc))
+
+            async def _key_pump():
+                loop = asyncio.get_event_loop()
+                while True:
+                    raw = await loop.run_in_executor(
+                        None, lambda: os.read(fd, 1)
+                    )
+                    ch = raw.decode("utf-8", errors="ignore")
+                    await event_queue.put(("key", ch))
+
+            ws_pump = asyncio.ensure_future(_ws_pump())
+            key_pump = asyncio.ensure_future(_key_pump())
+
+            _show_dial_prompt(digits)
+
             try:
-                async for raw in ws:
-                    await event_queue.put(("ws", json.loads(raw)))
-            except Exception as exc:
-                await event_queue.put(("error", exc))
+                while True:
+                    source, data = await event_queue.get()
 
-        async def _kbd_pump():
-            loop = asyncio.get_event_loop()
-            while True:
-                line = await loop.run_in_executor(None, sys.stdin.readline)
-                await event_queue.put(("kbd", line.strip().lower()))
+                    if source == "error":
+                        raise data
 
-        ws_pump = asyncio.ensure_future(_ws_pump())
-        kbd_pump = asyncio.ensure_future(_kbd_pump())
+                    # ── Keypress (dialing) ───────────────────────────────────
+                    if source == "key":
+                        ch = data
 
-        try:
-            while True:
-                source, data = await event_queue.get()
+                        if ch == '\x03':  # Ctrl-C
+                            raise KeyboardInterrupt
 
-                if source == "error":
-                    raise data
+                        # Digit key → append + DTMF tone
+                        if ch in DTMF_FREQS and len(digits) < MAX_DIAL_DIGITS:
+                            digits.append(ch)
+                            _play_dtmf_tone(ch, audio_sr)
+                            _show_dial_prompt(digits)
+                            continue
 
-                # ── Outgoing call ────────────────────────────────────────────
-                if source == "kbd":
-                    log.info("Calling…")
-                    await ws.send(json.dumps({"type": "call", "room": config["roomId"]}))
+                        # Backspace → remove last digit
+                        if ch in ('\x7f', '\x08') and digits:
+                            digits.pop()
+                            _show_dial_prompt(digits)
+                            continue
 
-                    # Wait for accept / reject (ignore other events)
-                    while True:
-                        src2, dat2 = await event_queue.get()
-                        if src2 == "ws" and dat2.get("type") in ("accept", "reject"):
-                            break
+                        # Enter → call if digits entered
+                        if ch in ('\r', '\n') and digits:
+                            dialed = ''.join(digits)
+                            digits.clear()
+                            print(f"\r\033[KCalling {dialed}…")
+                            log.info("Dialed %s — calling…", dialed)
+                            await ws.send(json.dumps({
+                                "type": "call", "room": config["roomId"],
+                            }))
 
-                    if dat2["type"] == "reject":
-                        print("\nCall rejected.\nPress Enter to call.\n")
+                            # Wait for accept / reject
+                            while True:
+                                src2, dat2 = await event_queue.get()
+                                if src2 == "ws" and dat2.get("type") in (
+                                    "accept", "reject",
+                                ):
+                                    break
+
+                            if dat2["type"] == "reject":
+                                print("Call rejected.")
+                                _show_dial_prompt(digits)
+                                continue
+
+                            log.info("Call accepted — connecting…")
+                            await _run_call(ws, event_queue, config, is_caller=True)
+                            print("Call ended.")
+                            _show_dial_prompt(digits)
+
+                        # Any other key → ignore
                         continue
 
-                    log.info("Call accepted — connecting…")
-                    await _run_call(ws, event_queue, config, is_caller=True)
-                    print("\nPress Enter to call.\n")
+                    # ── Incoming call ────────────────────────────────────────
+                    if source == "ws" and data.get("type") == "call":
+                        log.info("Incoming call!")
+                        ring_task = asyncio.ensure_future(_ring_loop(audio_sr))
+                        print("\r\033[KIncoming call — (y) answer / (n) reject ",
+                              end="", flush=True)
 
-                # ── Incoming call ─────────────────────────────────────────────
-                elif source == "ws" and data.get("type") == "call":
-                    log.info("Incoming call!")
+                        # Wait for y or n keypress
+                        while True:
+                            src2, dat2 = await event_queue.get()
+                            if src2 == "key" and dat2 in ("y", "n"):
+                                break
 
-                    ring_task = asyncio.ensure_future(
-                        _ring_loop(config["audio"]["sampleRate"])
-                    )
+                        ring_task.cancel()
+                        try:
+                            await ring_task
+                        except asyncio.CancelledError:
+                            pass
 
-                    print("\nIncoming call — answer? (y/n): ", end="", flush=True)
+                        if dat2 == "y":
+                            print(f"\r\033[KAnswering…")
+                            await ws.send(json.dumps({
+                                "type": "accept", "room": config["roomId"],
+                            }))
+                            await _run_call(ws, event_queue, config, is_caller=False)
+                            print("Call ended.")
+                        else:
+                            await ws.send(json.dumps({
+                                "type": "reject", "room": config["roomId"],
+                            }))
+                            print(f"\r\033[KCall rejected.")
 
-                    # Wait for y/n keyboard input (ignore WS events while prompting)
-                    while True:
-                        src2, dat2 = await event_queue.get()
-                        if src2 == "kbd":
-                            break
+                        _show_dial_prompt(digits)
 
-                    ring_task.cancel()
-                    try:
-                        await ring_task
-                    except asyncio.CancelledError:
-                        pass
-
-                    if dat2 in ("y", ""):
-                        await ws.send(json.dumps({"type": "accept", "room": config["roomId"]}))
-                        log.info("Answering…")
-                        await _run_call(ws, event_queue, config, is_caller=False)
-                        print("\nPress Enter to call.\n")
-                    else:
-                        await ws.send(json.dumps({"type": "reject", "room": config["roomId"]}))
-                        log.info("Call rejected.")
-                        print("\nPress Enter to call.\n")
-
-        finally:
-            ws_pump.cancel()
-            kbd_pump.cancel()
+            finally:
+                ws_pump.cancel()
+                key_pump.cancel()
+    finally:
+        if old_term is not None:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
 
 
 async def main():
